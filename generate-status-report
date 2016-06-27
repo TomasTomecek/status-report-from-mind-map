@@ -1,0 +1,210 @@
+#!/usr/bin/python2 -tt
+# -*- coding: utf-8 -*-
+
+"""
+Generate status report as markdown from mind map
+"""
+import argparse
+import json
+import logging
+import os
+import sys
+import datetime
+import smtplib
+from email.mime.text import MIMEText
+
+from mekk.xmind.document import XMindDocument
+
+
+logger = logging.getLogger("status-report-generator")
+
+
+def set_logging(level=logging.INFO):
+    global logger
+    logger.setLevel(level)
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter(
+        '%(asctime)s %(levelname)-6s %(message)s', '%H:%M:%S')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    mekk_logger = logging.getLogger("mekk.xmind")
+    null_handler = logging.NullHandler()
+    mekk_logger.addHandler(null_handler)
+
+
+class Conf:
+    def __init__(self, path):
+        self.path = path
+        self._c = None
+
+    @property
+    def c(self):
+        if self._c is None:
+            with open(self.path, "r") as fd:
+                self._c = json.load(fd)
+        return self._c
+
+    @property
+    def cc(self):
+        return self.c["cc"]
+
+    @property
+    def to(self):
+        return self.c["to"]
+
+    @property
+    def from_address(self):
+        return self.c["from"]
+
+    @property
+    def map_path(self):
+        return self.c["map"]
+
+    @property
+    def sheet_name(self):
+        return self.c["sheet_name"]
+
+
+class DataAggregator(object):
+
+    def __init__(self, week, map_path, sheet_name):
+        logger.debug("week = %s, map_path = %s, sheet = %s", week, map_path, sheet_name)
+        self.data = {}
+        self.week = week
+        self.map_path = map_path
+        self.sheet_name = sheet_name
+        self.year = datetime.datetime.now().year
+        self.sheet = self.get_data_sheet()
+        self.root_topic = self.sheet.get_root_topic()
+
+    def get_data_sheet(self):
+        if not os.path.isfile(self.map_path):
+            logger.error("Mind map not found: %s", self.map_path)
+            raise RuntimeError("Mind map not found: %s" % self.map_path)
+
+        xdoc = XMindDocument.open(self.map_path)
+
+        for sheet in xdoc.get_all_sheets():
+            try:
+                title = sheet.get_title()
+            except Exception as ex:
+                logger.warning("Exception when getting title: %r", ex)
+                continue
+            if title == self.sheet_name:
+                logger.debug("sheet found")
+                return sheet
+        logger.error("Sheet with data not found")
+        raise RuntimeError("Sheet %s not found" % self.sheet_name)
+
+    def process_children(self, child):
+        d = {}
+        if child.get_subtopics():
+            for sub_child in child.get_subtopics():
+                d[sub_child.get_title()] = self.process_children(sub_child)
+        return d or None
+
+    def get_week_node(self):
+        for child in self.root_topic.get_subtopics():
+            if int(child.get_title()) == self.year:
+                for sub_child in child.get_subtopics():
+                    if int(sub_child.get_title()) == self.week:
+                        return sub_child
+
+    def harvest_data(self):
+        for child in self.get_week_node().get_subtopics():
+            self.data[child.get_title()] = self.process_children(child)
+
+    def get_data(self):
+        return self.data
+
+
+class DataOutput(object):
+    def __init__(self, results):
+        self.results = results
+        self.output = []
+
+    def get_output(self):
+        return "\n".join(self.output)
+
+    def append_children(self, value, level):
+        if value:
+            for i in value.iterkeys():
+                s = "%s* %s" % (' ' * (level * 2), i)
+                logger.debug(s)
+                self.output.append(s)
+                self.append_children(value[i], level + 1)
+
+    def present_results(self):
+        self.append_children(self.results, 0)
+
+
+def send_email(content, subject, to, from_address, cc=None, dry_run=False):
+    logger.debug("subject = %s, to = %s, from = %s, cc = %s, dry-run = %s",
+                 subject, to, from_address, cc, dry_run)
+    msg = MIMEText(content)
+
+    msg['Subject'] = subject
+    msg['From'] = from_address
+    msg['to'] = to
+    if cc:
+        msg['cc'] = ", ".join(cc)
+
+    if not dry_run:
+        logger.info("about to send the e-mail")
+        s = smtplib.SMTP('localhost')
+        s.sendmail(from_address, [to], msg.as_string())
+        s.quit()
+        logger.info("e-mail sent")
+    else:
+        logger.info("not sending e-mail, dry-run is set")
+
+    logger.debug("from: %s, to: %s, cc: %s, subject: %s",
+                 from_address, to, cc, subject)
+
+
+def cli():
+    parser = argparse.ArgumentParser(
+        description="Status report generator"
+    )
+    parser.add_argument("--verbose", "-v", action="store_true", default=False)
+    parser.add_argument("--config", action="store", default="./config.json")
+    parser.add_argument("--dry-run", "-n", action="store_true", default=False)
+    parser.add_argument("WEEK", action="store", type=int, default=None, nargs="?")
+
+    args = parser.parse_args()
+
+    set_logging(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    return args
+
+
+def main():
+    args = cli()
+    week_no = args.WEEK
+    if week_no is None:
+        logger.info("using current week")
+        # let's get current
+        n = datetime.datetime.now()
+        week_no = n.isocalendar()[1]
+    logger.debug("week number is %d", week_no)
+
+    c = Conf(args.config)
+
+    da = DataAggregator(week_no, c.map_path, c.sheet_name)
+    da.harvest_data()
+    data = da.get_data()
+    o = DataOutput(data)
+    o.present_results()
+
+    mail_content = o.get_output()
+
+    send_email(mail_content, "Status report, week %d" % week_no, c.to, c.from_address, c.cc,
+               dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
