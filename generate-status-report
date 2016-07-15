@@ -115,7 +115,10 @@ class DataAggregator(object):
                         return sub_child
 
     def harvest_data(self):
-        for child in self.get_week_node().get_subtopics():
+        week_node = self.get_week_node()
+        if week_node is None:
+            raise Exception("Week node not found!")
+        for child in week_node.get_subtopics():
             self.data[child.get_title()] = self.process_children(child)
 
     def get_data(self):
